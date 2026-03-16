@@ -1,0 +1,357 @@
+#!/usr/bin/env python3
+"""
+Echo - A Claude-like Chatbot with Memory, Tools, and Safety
+------------------------------------------------------------
+Single-file implementation for easy copying and running.
+
+Requirements:
+    pip install transformers torch sentence-transformers chromadb requests
+
+Optional (for OpenAI/Claude):
+    pip install openai anthropic
+    Set environment variables 
+gsk_uCYYXYJgl2Fy3ngIv66iWGdyb3FYM
+"""
+
+import os
+import re
+import json
+import uuid
+import torch
+import requests
+from datetime import datetime
+from typing import List, Dict, Optional, Any
+from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline
+
+# Vector memory
+from sentence_transformers import SentenceTransformer
+import chromadb
+from chromadb.config import Settings
+
+# Optional API imports
+try:
+    import openai
+except ImportError:
+    openai = None
+try:
+    import anthropic
+except ImportError:
+    anthropic = None
+
+
+###############################################################################
+# 1. LLM Interface (supports local, OpenAI, Claude)
+###############################################################################
+class LLMInterface:
+    def __init__(self, model_type: str = "local", model_name: str = None):
+        """
+        model_type: "local", "openai", or "claude"
+        model_name: specific model name (Eclipse)
+        """
+        self.model_type = model_type
+        if model_type == "local":
+            if model_name is None:
+                model_name = "microsoft/Phi-3-mini-4k-instruct"  # Small, fast, good
+            print(f"Loading local model {model_name}...")
+            self.tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+            self.model = AutoModelForCausalLM.from_pretrained(
+                model_name,
+                torch_dtype=torch.float16,
+                device_map="auto",
+                trust_remote_code=True
+            )
+        elif model_type == "openai":
+            if openai is None:
+                raise ImportError("openai not installed")
+            openai.api_key = os.getenv("gsk_uCYYXYJgl2F")
+            if not openai.api_key:
+                raise ValueError("gsk_uCYYXYJgl2environment variable not set")
+            self.model_name = model_name or "gpt-4-turbo"
+        elif model_type == "claude":
+            if anthropic is None:
+                raise ImportError("anthropic not installed")
+            self.client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
+            self.model_name = model_name or "claude-3-opus-20240229"
+        else:
+            raise ValueError(f"Unknown model_type: {model_type}")
+
+    def generate(self, prompt: str, max_tokens: int = 1024, temperature: float = 0.7) -> str:
+        if self.model_type == "local":
+            inputs = self.tokenizer(prompt, return_tensors="pt").to(self.model.device)
+            with torch.no_grad():
+                outputs = self.model.generate(
+                    **inputs,
+                    max_new_tokens=max_tokens,
+                    temperature=temperature,
+                    do_sample=True,
+                    pad_token_id=self.tokenizer.eos_token_id
+                )
+            response = self.tokenizer.decode(outputs[0][inputs.input_ids.shape[1]:], skip_special_tokens=True)
+            return response.strip()
+        elif self.model_type == "openai":
+            response = openai.ChatCompletion.create(
+                model=self.model_name,
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=max_tokens,
+                temperature=temperature
+            )
+            return response.choices[0].message.content.strip()
+        elif self.model_type == "claude":
+            response = self.client.messages.create(
+                model=self.model_name,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                messages=[{"role": "user", "content": prompt}]
+            )
+            return response.content[0].text.strip()
+
+
+###############################################################################
+# 2. Vector Memory with ChromaDB
+###############################################################################
+class VectorMemory:
+    def __init__(self, persist_directory: str = "./chroma_db"):
+        self.embedder = SentenceTransformer('all-MiniLM-L6-v2')
+        self.client = chromadb.Client(Settings(
+            chroma_db_impl="duckdb+parquet",
+            persist_directory=persist_directory
+        ))
+        self.collection = self.client.get_or_create_collection(
+            name="conversations",
+            metadata={"hnsw:space": "cosine"}
+        )
+
+    def add_message(self, user_id: str, session_id: str, role: str, content: str):
+        """Store a message with embedding."""
+        embedding = self.embedder.encode(content).tolist()
+        self.collection.add(
+            embeddings=[embedding],
+            documents=[content],
+            metadatas=[{"user_id": user_id, "session_id": session_id, "role": role}],
+            ids=[f"{user_id}_{session_id}_{uuid.uuid4()}"]
+        )
+
+    def search_similar(self, user_id: str, query: str, n_results: int = 5) -> List[Dict]:
+        """Retrieve relevant past conversations."""
+        query_emb = self.embedder.encode(query).tolist()
+        results = self.collection.query(
+            query_embeddings=[query_emb],
+            n_results=n_results,
+            where={"user_id": user_id}
+        )
+        memories = []
+        for i in range(len(results['ids'][0])):
+            memories.append({
+                "content": results['documents'][0][i],
+                "metadata": results['metadatas'][0][i]
+            })
+        return memories
+
+
+###############################################################################
+# 3. Tool Registry
+###############################################################################
+class ToolRegistry:
+    def __init__(self):
+        self.tools = {
+            "calculator": self.calculator,
+            "web_search": self.web_search,
+            "current_time": self.current_time,
+        }
+
+    def calculator(self, expression: str) -> str:
+        """Evaluate a mathematical expression."""
+        try:
+            # Safe eval: only allow numbers and operators
+            allowed_names = {"abs": abs, "round": round}
+            code = compile(expression, "<string>", "eval")
+            for name in code.co_names:
+                if name not in allowed_names:
+                    return f"Error: Use of '{name}' not allowed"
+            result = eval(expression, {"__builtins__": {}}, allowed_names)
+            return str(result)
+        except Exception as e:
+            return f"Error: {e}"
+
+    def web_search(self, query: str) -> str:
+        """Simple web search using DuckDuckGo HTML (demo only)."""
+        # In production, use a proper search API
+        url = f"https://html.duckduckgo.com/html/?q={query}"
+        headers = {'User-Agent': 'Mozilla/5.0'}
+        try:
+            response = requests.get(url, headers=headers, timeout=5)
+            # Very basic parsing – just return snippet
+            return f"Search results for '{query}': (implement proper parsing)"
+        except Exception as e:
+            return f"Search failed: {e}"
+
+    def current_time(self) -> str:
+        return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    def execute(self, tool_name: str, arguments: dict) -> str:
+        if tool_name not in self.tools:
+            return f"Unknown tool: {tool_name}"
+        tool_func = self.tools[tool_name]
+        try:
+            result = tool_func(**arguments)
+            return result
+        except Exception as e:
+            return f"Tool execution error: {e}"
+
+
+###############################################################################
+# 4. Safety Filter
+###############################################################################
+class SafetyFilter:
+    def __init__(self):
+        print("Loading toxicity classifier...")
+        self.toxicity_classifier = pipeline(
+            "text-classification",
+            model="unitary/toxic-bert",
+            tokenizer="unitary/toxic-bert"
+        )
+        # Simple PII patterns
+        self.pii_patterns = [
+            r'\b\d{3}-\d{2}-\d{4}\b',  # SSN
+            r'\b\d{16}\b',              # credit card
+        ]
+
+    def check_input(self, text: str) -> bool:
+        """Return True if safe, False if toxic."""
+        result = self.toxicity_classifier(text)[0]
+        if result['label'] != 'non-toxic' and result['score'] > 0.7:
+            return False
+        for pattern in self.pii_patterns:
+            if re.search(pattern, text):
+                return False
+        return True
+
+    def check_output(self, text: str) -> bool:
+        return self.check_input(text)
+
+
+###############################################################################
+# 5. Orchestrator
+###############################################################################
+class Orchestrator:
+    def __init__(self, llm: LLMInterface, memory: VectorMemory, tools: ToolRegistry, safety: SafetyFilter):
+        self.llm = llm
+        self.memory = memory
+        self.tools = tools
+        self.safety = safety
+        # In-memory session history (short-term)
+        self.sessions = {}  # session_id -> list of messages
+
+    def process_message(self, user_id: str, session_id: str, message: str) -> str:
+        # 1. Safety check on input
+        if not self.safety.check_input(message):
+            return "I'm sorry, but your message contains inappropriate content."
+
+        # 2. Retrieve long-term memories
+        memories = self.memory.search_similar(user_id, message, n_results=3)
+        memory_context = "\n".join([f"Past: {m['content']}" for m in memories])
+
+        # 3. Get recent short-term history
+        session_history = self.sessions.get(session_id, [])
+        recent = session_history[-10:]
+
+        # 4. Build prompt with system instructions
+        system_prompt = """You are Echo, a helpful AI assistant. You have access to tools. 
+If you need to use a tool, respond with a JSON object containing "tool" and "arguments". 
+Otherwise, respond normally.
+
+Available tools:
+- calculator: {"tool": "calculator", "arguments": {"expression": "math expression"}}
+- web_search: {"tool": "web_search", "arguments": {"query": "search query"}}
+- current_time: {"tool": "current_time", "arguments": {}}
+
+Remember to be safe and helpful."""
+
+        full_prompt = system_prompt + "\n\n"
+        if memory_context:
+            full_prompt += f"Relevant memories:\n{memory_context}\n\n"
+        for msg in recent:
+            full_prompt += f"{msg['role']}: {msg['content']}\n"
+        full_prompt += f"user: {message}\nassistant:"
+
+        # 5. Generate response
+        response = self.llm.generate(full_prompt, max_tokens=1024, temperature=0.7)
+
+        # 6. Check for tool call
+        tool_call = None
+        try:
+            json_match = re.search(r'\{.*"tool".*\}', response, re.DOTALL)
+            if json_match:
+                tool_json = json.loads(json_match.group())
+                if "tool" in tool_json:
+                    tool_call = tool_json
+        except:
+            pass
+
+        # 7. Execute tool if needed
+        if tool_call:
+            tool_name = tool_call["tool"]
+            args = tool_call.get("arguments", {})
+            tool_result = self.tools.execute(tool_name, args)
+            full_prompt += f"\n[Tool result: {tool_result}]\nassistant:"
+            final_response = self.llm.generate(full_prompt, max_tokens=1024, temperature=0.7)
+        else:
+            final_response = response
+
+        # 8. Safety check on output
+        if not self.safety.check_output(final_response):
+            final_response = "I'm sorry, I cannot provide that response."
+
+        # 9. Store in memory
+        self.memory.add_message(user_id, session_id, "user", message)
+        self.memory.add_message(user_id, session_id, "assistant", final_response)
+
+        # Update session history
+        if session_id not in self.sessions:
+            self.sessions[session_id] = []
+        self.sessions[session_id].append({"role": "user", "content": message})
+        self.sessions[session_id].append({"role": "assistant", "content": final_response})
+
+        return final_response
+
+
+###############################################################################
+# 6. Main REPL
+###############################################################################
+def main():
+    print("=" * 60)
+    print("Echo - Claude-like Chatbot")
+    print("=" * 60)
+    print("\nInitializing components (this may take a moment)...")
+
+    # Choose LLM backend
+    llm_type = os.getenv("ECHO_LLM_TYPE", "local")
+    if llm_type not in ["local", "openai", "claude"]:
+        print(f"Invalid ECHO_LLM_TYPE '{llm_type}', using local.")
+        llm_type = "local"
+
+    try:
+        llm = LLMInterface(model_type=llm_type)
+    except Exception as e:
+        print(f"Error loading LLM: {e}")
+        print("Falling back to local model.")
+        llm = LLMInterface(model_type="local")
+
+    memory = VectorMemory()
+    tools = ToolRegistry()
+    safety = SafetyFilter()
+    orchestrator = Orchestrator(llm, memory, tools, safety)
+
+    user_id = str(uuid.uuid4())
+    session_id = str(uuid.uuid4())
+
+    print("\nChat started! Type 'exit' to quit.\n")
+
+    while True:
+        try:
+            user_input = input("You: ").strip()
+            if user_input.lower() in ["exit", "quit"]:
+                print("Goodbye!")
+                break
+
+            response = orchestrator.process_message(us
